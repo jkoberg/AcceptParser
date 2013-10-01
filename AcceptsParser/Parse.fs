@@ -1,153 +1,105 @@
-﻿module AcceptsParser.Parse
+﻿module AcceptsParser
 
 open FParsec
 
-let grammar = """
-  Content-Type   = "Content-Type" ":" media-type
-  media-type     = type "/" subtype *( ";" parameter )
-  parameter      = attribute "=" value
-  attribute      = token
-  value          = token | quoted-string
-  quoted-string  = ( <"> *(qdtext | quoted-pair ) <"> )
-  qdtext         = <any TEXT except <">>
-  quoted-pair    = "\" CHAR
-  type           = token
-  subtype        = token
-  token          = 1*<any CHAR except CTLs or separators>
-  separators     = "(" | ")" | "<" | ">" | "@"
-                 | "," | ";" | ":" | "\" | <">
-                 | "/" | "[" | "]" | "?" | "="
-                 | "{" | "}" | SP | HT
-  CTL            = <any US-ASCII ctl chr (0-31) and DEL (127)>
-  """
 type Param =
   | Q of float
   | Mxb of int64
   | Other of string * string
 
 type MediaRange = 
-  | Qualified of string * string
-  | SubtypesOf of string
+  | Qualified
+  | SubtypesOf
   | Any
 
 type AcceptItem = {
-  range: MediaRange
-  q: float option
-  mxb: int64 option
-  parameters: Param list
-  }
-       
-type Header = 
-  | Accept of AcceptItem list
-  | Other of string * string
-
-  
-
-module Elements = 
-  let rstrip (s:string) = s.TrimEnd()
-
-  let separators = "()<>@,;:\\\"/[]?={} \t"
-  let controls =  [| for n = 0 to 31 do yield char n |] |> System.String.Concat
-
-  let token = many1 (noneOf (separators + controls)) |>> System.String.Concat
-
-  let headerName = parse {
-    let! t = token
-    do! skipString ":"
-    return t
+    qualification: MediaRange
+    mtype: string
+    msubtype: string
+    q: float
+    mxb: int64 option
+    parameters: Param list
+    } with
+  static member Default = {
+    qualification = Any
+    mtype = "*"
+    msubtype = "*"
+    q = 1.0
+    mxb = None
+    parameters = []
     }
 
-  let indentedLine = many1 (anyOf " \t") >>. restOfLine true
+module Parse = 
+  let concat (s:'a seq) = System.String.Concat(s)
+  let rstrip (s:string) = s.TrimEnd()
 
+  let rec scanPs state = function
+    | [] -> state
+    | p::ps -> match p with
+                | Mxb count -> scanPs {state with mxb=Some count} ps
+                | Q q -> scanPs {state with q=q} ps
+                | _ -> scanPs {state with parameters=p::state.parameters} ps
 
-  let skipWs : Parser<unit,unit> = skipMany1 (anyOf " \t")
+  let unpackAcceptItem = function
+    | (("*","*"), ps) -> scanPs {AcceptItem.Default with mtype="*"; msubtype="*"; qualification=Any} ps
+    | ((t,"*"), ps) -> scanPs {AcceptItem.Default with mtype=t; msubtype="*"; qualification=SubtypesOf} ps
+    | ((t,st) as fulltype, ps) -> scanPs {AcceptItem.Default with mtype=t; msubtype=st; qualification=Qualified} ps
 
-  let nonNewlineSpaces =
-    skipWs <|>
-    skipAnyOf "\n" >>. skipWs 
+  let separators = "()<>@,;:\\\"/[]?={} \t"
+  let controls =  [| for n = 0 to 31 do yield char n |] |> concat
 
-  let rejoinLines = List.map rstrip >> String.concat " "
-  let headerValueLines = many1 indentedLine
-  let headerValue = headerValueLines |>> rejoinLines
- 
-  let body = (many anyChar |>> System.String.Concat) .>> eof
+  let TOKEN = many1 (noneOf (separators + controls)) |>> concat
 
-  let unquote= function
+  let QUOTEDPAIR = skipString "\\" >>. anyChar |>> function
     | 'r' -> '\r'  | 'n' -> '\n'  | 't' -> '\t'  | 'b' -> '\b'
     | 'a' -> '\a'  | 'f' -> '\f'  | 'v' -> '\v'  | _ as qc -> qc
 
-  let quotedPair = skipString "\\" >>. anyChar |>> unquote
-  let qdText = noneOf "\""
-  let quotedString = skipString "\""  >>. many (quotedPair <|> qdText) .>> skipString "\"" |>> System.String.Concat
+  let QDTEXT = noneOf "\""
+  let QUOTEDSTRING = skipString "\""  >>. many (QUOTEDPAIR <|> QDTEXT) .>> skipString "\"" |>> concat
 
-  let attribute = token
-  let value = token <|> quotedString
+  let ATTRIBUTE = TOKEN
+  let VALUE = TOKEN <|> QUOTEDSTRING
 
-  let parameter = attribute .>> skipString "=" .>>. value |>> Param.Other
-  let qparam = skipString "q=" >>. pfloat |>> Q
-  let mxbparam = skipString "mxb=" >>. pint64 |>> Mxb
-  let parameters = many (skipString ";" >>. (qparam <|> mxbparam <|> parameter))
+  let PARAMETER = ATTRIBUTE .>> skipString "=" .>>. VALUE |>> Param.Other
+  let QPARAM = skipString "q=" >>. pfloat |>> Q
+  let MXBPARAM = skipString "mxb=" >>. pint64 |>> Mxb
+  let PARAMETERS = many (skipString ";" >>. (QPARAM <|> MXBPARAM <|> PARAMETER))
 
-  let mtype = token
-  let msubtype = token
-
-  let rec scanPs state = function | [] -> state
-                                  | p::ps -> match p with | Mxb count -> scanPs {state with mxb=Some count} ps
-                                                          | Q q -> scanPs {state with q=Some q} ps
-                                                          | _ -> scanPs state ps
-
-  let rec scanPs' state = function
-    | [] -> state
-    | p::ps -> match p with
-               | Mxb count -> scanPs {state with mxb=Some count} ps
-               | Q q -> scanPs {state with q=Some q} ps
-               | _ -> scanPs state ps
-
-
-  let matchRange r (mt:string,mst:string) =
-    match r with
-    | Qualified (t,st) -> (t=mt, st=mst)
-    | SubtypesOf t -> (t=mt, true)
-    | Any -> true, true
-
-  let unpackAcceptItem = function
-    | (("*","*"), ps) -> scanPs {range=Any; q=None; mxb=None; parameters=ps} ps
-    | ((t,"*"), ps) -> scanPs {range=SubtypesOf t; q=None; mxb=None; parameters=ps} ps
-    | ((t,st) as fulltype, ps) -> scanPs {range=Qualified fulltype; q=None; mxb=None; parameters=ps} ps
-
-  let mediaType = mtype .>> skipString "/" .>>. msubtype .>>. parameters 
+  let MTYPE = TOKEN
+  let MSUBTYPE = TOKEN
+  let MEDIATYPE = MTYPE .>> skipString "/" .>>. MSUBTYPE .>>. PARAMETERS 
   
-  let accepts = parse {
+  let ACCEPTS = parse {
     do! spaces
-    let! mt = mediaType |>> unpackAcceptItem
+    let! mt = MEDIATYPE |>> unpackAcceptItem
     let! mts = many (parse {
       do! skipString ","
       do! spaces
-      return! mediaType |>> unpackAcceptItem
+      return!  MEDIATYPE |>> unpackAcceptItem
       })
     return mt :: mts
     }
 
-  let enumerate = List.mapi (fun n i -> n,i)
 
-  let sortAccepts fulltype = enumerate >> List.sortBy (fun (n,item:AcceptItem) -> (matchRange item.range fulltype), item.q, n)
+open Parse
 
-  let parseAcceptHeader = many1 mediaType |>> List.map unpackAcceptItem
+let findSortableMatches (accept:string)  (mt:string)  = [
+  match (run ACCEPTS accept, run MEDIATYPE mt) with
+  | Success (ais, _, _), Success (((t,st),ps),_,_) ->
+    for item in ais do
+      let matchingParams = Set item.parameters |> Set.intersect (Set ps) |> Set.toList
+      match item.qualification with
+      | Any -> yield ((0,0), List.length matchingParams, item.q), item, matchingParams
+      | SubtypesOf when item.mtype = t -> yield ((1,0), List.length matchingParams, item.q), item, matchingParams
+      | Qualified when item.mtype=t && item.msubtype=st -> yield ((1,1), List.length matchingParams, item.q), item, matchingParams
+      | _ -> ()
+  | _ -> ()
+  ]
 
-  let otherHeader = tuple2 headerName headerValue |>> Header.Other
-  let parseS s = runParserOnString parseAcceptHeader () "" s
-  let acceptHeader = skipString "Accept:" >>. accepts |>> Accept
+let FindMatches accept mt = 
+  let found = findSortableMatches accept mt |> List.sort |> List.rev
+  [for (sortKey, ai, matchedParams) in found -> (ai.mtype, ai.msubtype, ai.q, matchedParams)] 
 
-  let header = acceptHeader <|> otherHeader 
-  
-  let headers = (many1 header) .>> newline
-  let httpMessage = tuple2 headers body
-
-
-
-let parseHttpMessage = run Elements.httpMessage
-
-let parseAccepts = run Elements.accepts
 
 
 
